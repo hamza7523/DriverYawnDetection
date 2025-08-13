@@ -1,0 +1,7 @@
+{
+  "in_h": 96,
+  "in_w": 96,
+  "in_c": 3,
+  "onnx_input_name": "input_0",
+  "onnx_input_layout": "NHWC"
+}
