@@ -1,7 +1,15 @@
-tensorflow-cpu==2.12.0
-Flask==2.3.3
-numpy==1.26.4
-opencv-python-headless==4.8.0.78
+# ML / model
+tensorflow==2.12.0
+numpy==1.23.5
+h5py==3.8.0
+
+# OpenCV (headless for server / Render)
+opencv-python-headless==4.8.1.78
+
+# Web / utilities
+Flask==2.2.5
+gunicorn==20.1.0
+
+# misc
 Pillow==9.5.0
 requests==2.31.0
-h5py==3.8.0
