@@ -1,0 +1,111 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Yawn Detection (Flask)</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align:center; background:#f4f4f4; }
+    #video, #annot { border: 2px solid #333; border-radius: 6px; }
+    .alert { color: white; background: red; padding: 10px; margin-top:10px; display:inline-block; }
+    .controls { margin: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Real-time Yawn Detection</h1>
+
+  <div>
+    <video id="video" width="640" height="480" autoplay muted playsinline></video>
+    <canvas id="captureCanvas" width="640" height="480" style="display:none"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="resetBtn">Reset Server Counts</button>
+  </div>
+
+  <div>
+    <h3>Server Annotated Output</h3>
+    <img id="annot" width="640" height="480"/>
+  </div>
+
+  <div id="statusArea"></div>
+
+<script>
+let stream = null;
+let polling = false;
+let captureInterval = null;
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('captureCanvas');
+const ctx = canvas.getContext('2d');
+const annot = document.getElementById('annot');
+const statusArea = document.getElementById('statusArea');
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    document.getElementById('startBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
+    polling = true;
+    captureInterval = setInterval(sendFrameToServer, 300); // send a frame every 300 ms (~3 FPS)
+  } catch (err) {
+    alert('Camera error: ' + err.message);
+  }
+}
+
+function stopCamera() {
+  polling = false;
+  if (captureInterval) {
+    clearInterval(captureInterval);
+    captureInterval = null;
+  }
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+}
+
+async function sendFrameToServer() {
+  if (!polling || !video || video.readyState !== 4) return;
+  // draw video frame to canvas
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL('image/png');
+
+  try {
+    const res = await fetch('/predict', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ image: dataUrl })
+    });
+    const j = await res.json();
+    if (j.image) {
+      annot.src = j.image;
+    }
+    statusArea.innerHTML = '<p>Status: ' + j.status + ' | Recent yawns: ' + j.yawn_count_recent + (j.alert ? ' <span class="alert">ALERT!</span>' : '') + '</p>';
+  } catch (e) {
+    console.error('Server error', e);
+    statusArea.innerHTML = '<p style="color:red">Server error</p>';
+  }
+}
+document.getElementById('resetBtn').addEventListener('click', async () => {
+  try {
+    const res = await fetch('/reset', { method: 'POST' });
+    const j = await res.json();
+    statusArea.innerHTML = '<p>Server state reset</p>';
+  } catch (e) {
+    statusArea.innerHTML = '<p style="color:red">Reset failed</p>';
+  }
+});
+
+
+
+document.getElementById('startBtn').addEventListener('click', startCamera);
+document.getElementById('stopBtn').addEventListener('click', stopCamera);
+</script>
+</body>
+</html>
