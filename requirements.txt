@@ -2,7 +2,8 @@
 numpy==1.23.5
 
 # TensorFlow (supports Python 3.9 - 3.11)
-tensorflow==2.12.0
+tensorflow==2.15.0
+keras==3.8.0
 h5py==3.8.0
 
 # OpenCV (headless for server; pick a version that exists on PyPI)
