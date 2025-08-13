@@ -19,7 +19,7 @@ from ultralytics import YOLO
 # filenames expected in project root
 ONNX_MODEL = "yawn_model.onnx"
 META_FILE = "model_metaPytorch.json"
-YOLO_FACE = "yolov8n_face.pt"   # put your yolov8 face weights here
+YOLO_FACE = "yolov8n-face.pt"   # put your yolov8 face weights here
 
 # runtime params
 FRAME_SCALE_WIDTH = 640
