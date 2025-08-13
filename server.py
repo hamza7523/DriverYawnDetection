@@ -1,10 +1,5 @@
-# server.py
-# runtime server: uses ONNX Runtime for yawn model and ultralytics YOLO for face detection
-
-import io
-import base64
-import time
-import threading
+# server.py (updated, more robust error handling + YOLO parsing)
+import io, base64, time, threading, traceback
 from datetime import datetime
 from pathlib import Path
 from collections import deque
@@ -16,17 +11,20 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import onnxruntime as ort
 from ultralytics import YOLO
-# filenames expected in project root
-ONNX_MODEL = "yawn_model.onnx"
-META_FILE = "model_metaPytorch.json"
-YOLO_FACE = "yolov8n-face.pt"   # put your yolov8 face weights here
 
-# runtime params
+# ---------- CONFIG ----------
+DEBUG = True  # set False in production on Render
+ONNX_MODEL = "yawn_model.onnx"           # your ONNX model (or yawn_96.onnx)
+META_FILE = "model_metaPytorch.json"
+YOLO_FACE = "yolov8n-face.pt"
 FRAME_SCALE_WIDTH = 640
 CONSECUTIVE_REQUIRED = 6
 YAWN_PROB_THRESHOLD = 0.5
 ALERT_COUNT = 5
 ALERT_WINDOW_SECONDS = 120
+# ----------------------------
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # state
 state_lock = threading.Lock()
@@ -46,187 +44,242 @@ def count_recent():
     with state_lock:
         return len(yawn_timestamps)
 
-# load meta
+# helper: load meta
 meta_path = Path(META_FILE)
 if not meta_path.exists():
-    raise FileNotFoundError(f"Missing {META_FILE}. Run conversion script first.")
-meta = json.loads(meta_path.read_text())
+    if DEBUG:
+        print(f"Warning: {META_FILE} not found. Proceeding with defaults (96x96x3)")
+    meta = {}
+else:
+    meta = json.loads(meta_path.read_text())
+
 IN_H = int(meta.get("in_h", 96))
 IN_W = int(meta.get("in_w", 96))
 IN_C = int(meta.get("in_c", 3))
-ONNX_INPUT_NAME = meta.get("onnx_input_name")
+ONNX_INPUT_NAME = meta.get("onnx_input_name", None)
 INPUT_LAYOUT = meta.get("onnx_input_layout", "NHWC")
-print("Model meta:", meta)
 
-# load onnx runtime session
+# load ONNX runtime
 onnx_path = Path(ONNX_MODEL)
 if not onnx_path.exists():
-    raise FileNotFoundError(f"Missing ONNX model: {ONNX_MODEL}. Run conversion script first.")
-print("Loading ONNX Runtime session...")
-sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    if DEBUG:
+        print(f"Warning: ONNX model {ONNX_MODEL} not found. ONNX inference disabled.")
+    sess = None
+else:
+    try:
+        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        # detect input name if not provided
+        if ONNX_INPUT_NAME is None:
+            ONNX_INPUT_NAME = sess.get_inputs()[0].name
+        if DEBUG:
+            print("ONNX session created. input name:", ONNX_INPUT_NAME)
+    except Exception as e:
+        print("Failed to create ONNX session:", e)
+        sess = None
 
-# load YOLO face detector
+# load YOLO face model
 yolo_path = Path(YOLO_FACE)
 if not yolo_path.exists():
-    raise FileNotFoundError(f"Missing YOLO face weights: {YOLO_FACE}")
-print("Loading YOLO face detector...")
-face_model = YOLO(str(yolo_path))
+    raise FileNotFoundError(f"Missing YOLO weights: {YOLO_FACE}. Put the .pt file in repo root.")
 
-# helper image conversions
+try:
+    face_model = YOLO(str(yolo_path))
+    if DEBUG: print("Loaded YOLO model.")
+except Exception as e:
+    print("Failed to load YOLO model:", e)
+    raise
+
+# PIL <> base64 helpers
 def dataurl_from_pil(img):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    b = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b}"
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 def pil_from_dataurl(data_url):
-    header, b64 = data_url.split(",", 1)
-    b = base64.b64decode(b64)
-    return Image.open(io.BytesIO(b)).convert("RGB")
+    header, b64 = data_url.split(",", 1) if "," in data_url else ("", data_url)
+    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
-# preprocess for ONNX according to input layout
+# preprocess for ONNX
 def preprocess_roi(pil_roi):
     roi = pil_roi.resize((IN_W, IN_H)).convert("RGB")
-    arr = np.asarray(roi).astype("float32") / 255.0  # H W C (NHWC)
-    if INPUT_LAYOUT == "NHWC":
-        inp = np.expand_dims(arr, axis=0)  # 1 H W C
+    arr = np.asarray(roi).astype("float32") / 255.0
+    if INPUT_LAYOUT.upper() == "NHWC":
+        inp = arr[None, ...]  # 1,H,W,C
     else:
-        # NCHW
-        inp = np.transpose(arr, (2, 0, 1))[None, ...]  # 1 C H W
+        inp = np.transpose(arr, (2,0,1))[None, ...]  # 1,C,H,W
     return inp
 
 def run_onnx_inference(inp_array):
-    # sess.run expects feeds as {input_name: arr}
-    feed = {ONNX_INPUT_NAME: inp_array}
+    if sess is None:
+        raise RuntimeError("ONNX session not initialized")
+    feed = {ONNX_INPUT_NAME: inp_array} if ONNX_INPUT_NAME else {sess.get_inputs()[0].name: inp_array}
     out = sess.run(None, feed)
     return out
+
+# Robust extraction from ultralytics Result
+def extract_boxes_and_confs(result):
+    boxes = []
+    confs = []
+    try:
+        boxes_obj = getattr(result.boxes, "xyxy", None)
+        confs_obj = getattr(result.boxes, "conf", None)
+        if boxes_obj is not None:
+            # try several access patterns
+            try:
+                arr = boxes_obj.cpu().numpy()
+            except Exception:
+                try:
+                    arr = np.array(boxes_obj)
+                except Exception:
+                    arr = None
+            if arr is not None:
+                boxes = arr.tolist()
+        if confs_obj is not None:
+            try:
+                c_arr = confs_obj.cpu().numpy()
+            except Exception:
+                try:
+                    c_arr = np.array(confs_obj)
+                except Exception:
+                    c_arr = None
+            if c_arr is not None:
+                confs = c_arr.tolist()
+    except Exception as e:
+        if DEBUG: print("extract_boxes_and_confs error:", e)
+    return boxes, confs
 
 # core processing
 def process_frame_and_annotate(pil_img):
     global consecutive_yawn_frames, yawn_total, yawn_active
 
-    # scale to FRAME_SCALE_WIDTH width
-    w0, h0 = pil_img.size
-    if w0 != FRAME_SCALE_WIDTH:
-        ratio = FRAME_SCALE_WIDTH / float(w0)
-        pil_img = pil_img.resize((FRAME_SCALE_WIDTH, int(h0 * ratio)))
+    try:
+        w0, h0 = pil_img.size
+        if w0 != FRAME_SCALE_WIDTH:
+            ratio = FRAME_SCALE_WIDTH / float(w0)
+            pil_img = pil_img.resize((FRAME_SCALE_WIDTH, int(h0 * ratio)))
 
-    draw = ImageDraw.Draw(pil_img)
-    status_text = "No face"
+        draw = ImageDraw.Draw(pil_img)
+        status_text = "No face"
 
-    # detect faces
-    results = face_model(pil_img, imgsz=640, half=False)
-    face_box = None
-    if len(results) > 0:
-        res = results[0]
-        boxes_obj = getattr(res.boxes, "xyxy", None)
-        confs_obj = getattr(res.boxes, "conf", None)
-        if boxes_obj is not None and len(boxes_obj) > 0:
-            try:
-                boxes_list = boxes_obj.tolist()
-            except Exception:
-                boxes_list = [[float(x) for x in boxes_obj[i]] for i in range(len(boxes_obj))]
-            best = None
-            best_area = 0.0
-            for i, b in enumerate(boxes_list):
-                x1, y1, x2, y2 = b
-                area = (x2 - x1) * (y2 - y1)
-                conf_val = 0.0
-                try:
-                    conf_val = float(confs_obj[i])
-                except Exception:
+        # run YOLO
+        try:
+            np_frame = np.array(pil_img)  # H,W,3 (RGB)
+            results = face_model(np_frame, imgsz=640, half=False)  # list of Results
+        except Exception as e:
+            if DEBUG:
+                print("YOLO inference failed:", e)
+                traceback.print_exc()
+            results = []
+
+        face_box = None
+        if results:
+            res = results[0]
+            boxes, confs = extract_boxes_and_confs(res)
+            if boxes:
+                # pick box with max area * conf
+                best = None; best_score = -1.0
+                for i, b in enumerate(boxes):
                     try:
-                        conf_val = float(confs_obj[i].item())
+                        x1, y1, x2, y2 = [float(v) for v in b]
                     except Exception:
-                        conf_val = 0.0
-                if area > best_area:
-                    best_area = area
-                    best = (x1, y1, x2, y2, conf_val)
-            if best is not None:
+                        continue
+                    area = (x2 - x1) * (y2 - y1)
+                    conf_val = confs[i] if (i < len(confs)) else 0.0
+                    score = area * (conf_val if conf_val is not None else 1.0)
+                    if score > best_score:
+                        best_score = score
+                        best = (x1, y1, x2, y2, float(conf_val) if conf_val is not None else 0.0)
                 face_box = best
 
-    if face_box is None:
-        with state_lock:
-            consecutive_yawn_frames = 0
-            yawn_active = False
-        status_text = "No face"
-    else:
-        x1, y1, x2, y2, conf = face_box
-        draw.rectangle([(x1, y1), (x2, y2)], outline="green", width=3)
-        fh = y2 - y1
-        lower_top = y1 + int(fh * 0.55)
-        mouth_box = (x1, lower_top, x2, y2)
-        draw.rectangle(mouth_box, outline="yellow", width=2)
-
-        mx1, my1, mx2, my2 = [int(v) for v in mouth_box]
-        mx1 = max(0, mx1); my1 = max(0, my1)
-        mx2 = min(pil_img.width, mx2); my2 = min(pil_img.height, my2)
-
-        if mx2 <= mx1 or my2 <= my1:
+        # no face
+        if face_box is None:
             with state_lock:
                 consecutive_yawn_frames = 0
                 yawn_active = False
-            status_text = "Empty mouth roi"
+            status_text = "No face"
         else:
-            roi = pil_img.crop((mx1, my1, mx2, my2)).convert("RGB")
-            inp = preprocess_roi(roi)  # numpy array shaped according to INPUT_LAYOUT
-            try:
-                out = run_onnx_inference(inp)
-                # out is a list of outputs; we choose first output
-                out0 = out[0]
-                out0 = np.asarray(out0)
-                # handle shapes: (1,), (1,1), (1,2), etc
-                prob = 0.0
-                if out0.ndim == 1 and out0.size == 1:
-                    prob = float(out0.ravel()[-1])
-                elif out0.ndim == 2 and out0.shape[1] == 1:
-                    prob = float(out0[0,0])
-                elif out0.ndim == 2 and out0.shape[1] >= 2:
-                    prob = float(out0[0,1])
-                else:
-                    prob = float(out0.ravel()[-1])
-            except Exception as e:
-                print("ONNX inference error:", e)
-                prob = 0.0
+            x1, y1, x2, y2, conf = face_box
+            # clamp to ints and inside image
+            x1_i = max(0, int(round(x1))); y1_i = max(0, int(round(y1)))
+            x2_i = min(pil_img.width - 1, int(round(x2))); y2_i = min(pil_img.height - 1, int(round(y2)))
+            draw.rectangle([(x1_i, y1_i), (x2_i, y2_i)], outline="green", width=3)
 
-            if prob > YAWN_PROB_THRESHOLD:
-                with state_lock:
-                    consecutive_yawn_frames += 1
-                    if (not yawn_active) and (consecutive_yawn_frames >= CONSECUTIVE_REQUIRED):
-                        yawn_active = True
-                        yawn_timestamps.append(time.time())
-                        yawn_total += 1
-                        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Yawn counted total={yawn_total}")
-                status_text = f"Yawning {prob:.2f}"
-            else:
+            fh = y2_i - y1_i
+            lower_top = y1_i + int(fh * 0.55)
+            mouth_box = (x1_i, lower_top, x2_i, y2_i)
+            draw.rectangle(mouth_box, outline="yellow", width=2)
+
+            mx1, my1, mx2, my2 = mouth_box
+            if mx2 <= mx1 or my2 <= my1:
                 with state_lock:
                     consecutive_yawn_frames = 0
                     yawn_active = False
-                status_text = f"Monitoring {prob:.2f}"
+                status_text = "Empty mouth roi"
+            else:
+                roi = pil_img.crop((mx1, my1, mx2, my2)).convert("RGB")
+                # ONNX inference
+                try:
+                    inp = preprocess_roi(roi)
+                    out = run_onnx_inference(inp)
+                    out0 = np.asarray(out[0])
+                    # robust prob extraction
+                    prob = 0.0
+                    if out0.ndim == 1 and out0.size >= 1:
+                        prob = float(out0.ravel()[-1])
+                    elif out0.ndim == 2 and out0.shape[1] == 1:
+                        prob = float(out0[0,0])
+                    elif out0.ndim == 2 and out0.shape[1] >= 2:
+                        prob = float(out0[0,1])
+                    else:
+                        prob = float(out0.ravel()[-1])
+                except Exception as e:
+                    if DEBUG:
+                        print("ONNX inference error:", e)
+                        traceback.print_exc()
+                    prob = 0.0
 
-    recent = count_recent()
-    alert_on = recent >= ALERT_COUNT
+                if prob > YAWN_PROB_THRESHOLD:
+                    with state_lock:
+                        consecutive_yawn_frames += 1
+                        if (not yawn_active) and (consecutive_yawn_frames >= CONSECUTIVE_REQUIRED):
+                            yawn_active = True
+                            yawn_timestamps.append(time.time())
+                            yawn_total += 1
+                            print(f"[{datetime.now()}] Yawn counted total={yawn_total}")
+                    status_text = f"Yawning {prob:.2f}"
+                else:
+                    with state_lock:
+                        consecutive_yawn_frames = 0
+                        yawn_active = False
+                    status_text = f"Monitoring {prob:.2f}"
 
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
+        recent = count_recent()
+        alert_on = recent >= ALERT_COUNT
 
-    draw.text((10, 10), f"Status: {status_text}", fill="white", font=font)
-    draw.text((10, 30), f"Yawns last {ALERT_WINDOW_SECONDS//60}m: {recent}", fill="white", font=font)
-    draw.text((10, 50), f"Yawns total: {yawn_total}", fill="white", font=font)
-    if alert_on:
-        draw.rectangle([(0, pil_img.height - 40), (pil_img.width, pil_img.height)], fill="red")
-        draw.text((10, pil_img.height - 30), f"ALERT: {recent} yawns recent", fill="white", font=font)
+        # overlays (text)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        draw.text((10, 6), f"Status: {status_text}", fill="white", font=font)
+        draw.text((10, 26), f"Yawns last {ALERT_WINDOW_SECONDS//60}m: {recent}", fill="white", font=font)
+        draw.text((10, 46), f"Yawns total: {yawn_total}", fill="white", font=font)
+        if alert_on:
+            draw.rectangle([(0, pil_img.height - 40), (pil_img.width, pil_img.height)], fill="red")
+            draw.text((10, pil_img.height - 30), f"ALERT: {recent} yawns recent", fill="white", font=font)
 
-    return pil_img, status_text, recent, alert_on
+        return pil_img, status_text, recent, alert_on
 
-# Flask app
-app = Flask(__name__, static_folder="static", template_folder="templates")
+    except Exception as e:
+        # unexpected error while processing frame
+        if DEBUG:
+            print("Unexpected error in process_frame_and_annotate:")
+            traceback.print_exc()
+        raise
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("templates\index.html")
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -244,8 +297,15 @@ def predict():
             "alert": bool(alert_on)
         })
     except Exception as e:
-        print("Predict error", e)
-        return jsonify({"error": str(e)}), 500
+        # write full traceback to server log
+        tb = traceback.format_exc()
+        print("Predict error:", e)
+        print(tb)
+        # return structured error detail when debugging
+        if DEBUG:
+            return jsonify({"error": str(e), "traceback": tb}), 500
+        else:
+            return jsonify({"error": "internal server error"}), 500
 
 @app.route("/reset", methods=["POST"])
 def reset():
@@ -256,3 +316,16 @@ def reset():
         yawn_total = 0
         yawn_active = False
     return jsonify({"status": "reset"})
+
+@app.route("/health")
+def health():
+    ok = True
+    messages = []
+    # quick checks
+    messages.append(f"YOLO loaded: {'yes' if 'face_model' in globals() else 'no'}")
+    messages.append(f"ONNX session: {'yes' if sess is not None else 'no'}")
+    return jsonify({"ok": ok, "messages": messages})
+
+if __name__ == "__main__":
+    # local testing: enable debug and reload; in production use gunicorn
+    app.run(host="0.0.0.0", port=5000, debug=DEBUG)

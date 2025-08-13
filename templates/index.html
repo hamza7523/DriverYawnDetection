@@ -70,28 +70,39 @@ function stopCamera() {
   document.getElementById('stopBtn').disabled = true;
 }
 
+
 async function sendFrameToServer() {
   if (!polling || !video || video.readyState !== 4) return;
-  // draw video frame to canvas
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-  const dataUrl = canvas.toDataURL('image/png');
-
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.7); // smaller than PNG
   try {
     const res = await fetch('/predict', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ image: dataUrl })
     });
-    const j = await res.json();
-    if (j.image) {
-      annot.src = j.image;
+    if (!res.ok) {
+      let txt = await res.text();
+      let json = null;
+      try { json = JSON.parse(txt); } catch(e) { json = null; }
+      let errMsg = json && json.error ? (json.error + (json.traceback ? ("\n\n" + json.traceback) : "")) : txt;
+      statusArea.innerHTML = '<p style="color:red">Server error: <pre style="white-space:pre-wrap;">' + escapeHtml(errMsg) + '</pre></p>';
+      return;
     }
+    const j = await res.json();
+    if (j.image) annot.src = j.image;
     statusArea.innerHTML = '<p>Status: ' + j.status + ' | Recent yawns: ' + j.yawn_count_recent + (j.alert ? ' <span class="alert">ALERT!</span>' : '') + '</p>';
   } catch (e) {
-    console.error('Server error', e);
-    statusArea.innerHTML = '<p style="color:red">Server error</p>';
+    statusArea.innerHTML = '<p style="color:red">Network error: ' + e.message + '</p>';
   }
 }
+
+function escapeHtml(unsafe) {
+  return unsafe.replace(/[&<"'>]/g, function(m) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m];
+  });
+}
+
 document.getElementById('resetBtn').addEventListener('click', async () => {
   try {
     const res = await fetch('/reset', { method: 'POST' });
