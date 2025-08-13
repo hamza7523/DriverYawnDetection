@@ -16,7 +16,6 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import onnxruntime as ort
 from ultralytics import YOLO
-
 # filenames expected in project root
 ONNX_MODEL = "yawn_model.onnx"
 META_FILE = "model_metaPytorch.json"

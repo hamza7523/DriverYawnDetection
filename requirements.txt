@@ -1,17 +1,6 @@
-# Core numeric stack (install numpy first)
-numpy==1.23.5
-
-# TensorFlow (supports Python 3.9 - 3.11)
-tensorflow==2.15.0
-h5py==3.8.0
-
-# OpenCV (headless for server; pick a version that exists on PyPI)
-opencv-python-headless==4.8.1.78
-
-# Web framework & WSGI
-Flask==2.2.5
-gunicorn==20.1.0
-
-# Utilities
-Pillow==9.5.0
-requests==2.31.0
+flask
+pillow
+ultralytics
+onnxruntime==1.20.1
+numpy
+gunicorn
